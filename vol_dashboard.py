@@ -1,72 +1,77 @@
-import sys
-import os
-current_dir = os.path.dirname(os.path.abspath(__file__))  
-parent_dir = os.path.dirname(current_dir)  
-realized_vol_path = os.path.join(parent_dir, 'realized_vol')
-print(realized_vol_path)
-sys.path.append(realized_vol_path)
-import streamlit as st
-import yfinance as yf
+import dash
+from dash import dcc, html, Input, Output, State
+import plotly.graph_objs as go
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
 from realized_vol.data_loader import MarketDataLoader
 from realized_vol.vol_engine import RealizedVolEngine
+from utils import detect_spikes
 
-import streamlit as st
-st.write("Volatility Engine imported successfully!")
+app = dash.Dash(__name__)
+server = app.server
 
-@st.cache_data
-def fetch_data(tickers, start_date, end_date):
-    loader = MarketDataLoader(tickers=tickers, start=start_date, end=end_date)
-    price_data = loader.fetch_price_series()
-    return price_data
+loader = MarketDataLoader()
 
-def highlight_spikes(vol_data, threshold_factor=2):
-    avg_vol = vol_data.rolling(window=21).mean()
-    spike_threshold = avg_vol * threshold_factor
-    spikes = vol_data[vol_data > spike_threshold]
-    return spikes
+app.layout = html.Div([
+    html.H1("Realized Volatility Engine"),
 
-st.title("Volatility Dashboard")
+    dcc.Input(id='ticker-input', type='text', placeholder='Enter Ticker(s) seprated by comma'),
+    html.Button('Load Data', id='load-button', n_clicks=0),
 
-ticker = st.sidebar.text_input("Enter Ticker:", "AAPL")
-start_date = st.sidebar.date_input("Start Date:", pd.to_datetime("2020-01-01"))
-end_date = st.sidebar.date_input("End Date:", pd.to_datetime("2025-04-07"))
-vol_type = st.sidebar.selectbox("Select Vol Type", ["Simple Realized VOL", "Parkinson VOL", "Garman-Klass VOL", "Hodges-Tompkins VOL"])
-spike_threshold = st.sidebar.number_input("Set Spike Threshold", min_value=0.0, max_value=2.0, value=2.0,  step=0.1)
+    dcc.Checklist(
+        id='vol-types',
+        options=[{'label': v, 'value': v} for v in ['Realized VOL', 'Parkinson VOL', 'Garman-Klass VOL', 'Hodges-Tompkins VOL']],
+        value=['Realized VOL', 'Parkinson VOL', 'Garman-Klass VOL', 'Hodges-Tompkins VOL'],
+        labelStyle={'display': 'inline-block'}
+    ),
 
-price_data = fetch_data([ticker], str(start_date), str(end_date))
-engine = RealizedVolEngine(price_series=price_data)
-vol_data = None
+    html.Div(id='plots-container')
+])
 
-if vol_type == "Simple Realized VOL":
-    vol_data = engine.compute_realized_vol()
-elif vol_type == "Parkinson VOL":
-    vol_data = engine.compute_parkinson_vol()
-elif vol_type == "Garman-Klass VOL":
-    vol_data = engine.compute_garman_klass_vol()
-elif vol_type == "Hodges-Tompkins VOL":
-    vol_data = engine.compute_hodges_tomkins_vol()
+@app.callback(
+    Output('plots-container', 'children'),
+    Input('load-button', 'n_clicks'),
+    State('ticker-input', 'value'),
+    State('vol-types', 'value')
+)
+def update_graph(n_clicks, tickers, selected_vols):
+    if n_clicks == 0 or not tickers:
+        return []
+    
+    tickers = [ticker.strip().upper() for ticker in tickers.split(',')]
+    loader.set_tickers(tickers)
+    df = loader.fetch_price_series()
 
-spikes = highlight_spikes(vol_data=vol_data, threshold_factor=float(spike_threshold))
+    graphs = []
 
-st.subheader(f"Volatility Analysis for {ticker}")
-fig, ax = plt.subplots(figsize=(10, 6))
+    for ticker in tickers:
+        price_data = df['Close'][ticker] if len(tickers) > 1 else df['Close']
+        prices = df.xs(ticker, axis=1, level=1, drop_level=False) if len(tickers) > 1 else df
 
-ax.plot(vol_data, label=f"{vol_type} - {ticker}")
-ax.scatter(spikes.index, spikes, color="red", label="Volatility Spikes", zorder=5)
+        engine = RealizedVolEngine(prices)
 
-ax.set_title(f"{vol_type} for {ticker}")
-ax.set_xlabel("Date")
-ax.set_ylabel("Volatility")
-ax.legend()
+        vols = engine.calculate_all_volatility_types()
+        crosshair_time = vols.index
 
-st.pyplot(fig)
+        traces = [go.Scatter(x=crosshair_time, y=price_data, name=f"{ticker} Price", yaxis='y2')]
 
-mean_volatility = vol_data.mean()  
-if isinstance(mean_volatility, pd.Series):
-    mean_volatility = mean_volatility.values[0]
-st.subheader("Statistics")
-st.write(f"Average Volatility: {mean_volatility:.4f}")
-st.write(f"Volatility Spikes (above threshold): {len(spikes)}")
+        for vol_type in selected_vols:
+            traces.append(go.Scatter(x=crosshair_time, y=vols[vol_type], name=f"{ticker} - { vol_type}"))
+
+        annotations = detect_spikes(vols['Realized VOL'])
+
+        layout = go.Layout(
+            title=f'{ticker} Volatility & Price',
+            xaxis=dict(showspikes=True, spikemode='across', spikesnap='cursor', showline=True),
+            yaxis=dict(title='Volatility'),
+            yaxis2=dict(title='Price', overlaying='y', side='right'),
+            hovermode='x unified',
+            annotations=annotations
+        )
+
+        fig = go.Figure(data=traces, layout=layout)
+        graphs.append(dcc.Graph(figure=fig))
+
+    return graphs
+
+if __name__ == "__main__":
+    app.run(debug=True)
